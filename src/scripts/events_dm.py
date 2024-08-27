@@ -40,13 +40,8 @@ def main():
                                            F.col('city'),
                                            F.col('lat').alias('lat_city'),
                                            F.col('lng').alias('lon_city'),
-                                           F.col('timezone')))
-
-    home_address_df = events_df.crossJoin(geo_df.select(F.col('id').alias('zone_id'),
-                                                                F.col('city'),
-                                                                F.col('lat').alias('lat_city'),
-                                                                F.col('lng').alias('lon_city'),
-                                                                F.col('timezone')))
+                                           F.col('timezone'),
+                                           ))
 
     df = df.withColumn("distance", F.lit(2) * F.lit(earth_radius)
                                             * F.asin(F.sqrt(F.pow(F.sin((F.radians(F.col('lat')) - F.radians(F.col('lat_city')))/F.lit(2)), 2)
@@ -54,7 +49,7 @@ def main():
                                             * F.cos(F.radians(F.col('lat_city')))
                                             * F.pow(F.sin((F.radians(F.col('lon')) - F.radians(F.col('lon_city')))/F.lit(2)), 2))))
 
-    df = df.select('event', 'event_type', 'zone_id', 'city', 'distance')
+    df = df.select('event', 'event_type', 'zone_id', 'city', 'distance', F.date_trunc("day",F.coalesce(F.col('event.datetime'),F.col('event.message_ts'))).alias("date"), F.col('event.message_from').alias('user_id'))
     df = df.join(df.select('event', 'distance').groupBy('event').agg(F.min('distance')), 'event')
     df = df.filter((F.col('distance') == F.col('min(distance)')) & (F.col('event.user').isNotNull())) 
 
@@ -63,16 +58,20 @@ def main():
     true_city_df = df.filter(df.row_number == 1).select(F.col('event.user').alias('user_id'), F.col('city').alias('act_city'))
     df = df.drop("row_number")
 
-    df1 = home_address_df.select(F.col('event.message_from').alias('user_id'),"city",F.date_trunc("day",F.coalesce(F.col('event.datetime'),F.col('event.message_ts'))).alias("date"))
-    home_city_df = (df1.withColumn("row_date",F.row_number().over(
-            Window.partitionBy("user_id", "city").orderBy(F.col("date").desc())))
-            .filter(F.col("row_date") >= 27)
-            .withColumn("row_by_row_date", F.row_number().over(
-            Window.partitionBy("user_id").orderBy(F.col("row_date").desc())))
-            .filter(F.col("row_by_row_date") == 1)
-            .withColumnRenamed("user_id", "user_id")
-            .withColumnRenamed("city", "home_city")
-            .drop("row_date", "row_by_row_date", "date"))
+    temp_df = (df.withColumn('max_date',F.max('date')\
+        .over(Window().partitionBy('user_id')))\
+        .withColumn('city_name_lag_1_desc',F.lag('city',-1,'start')\
+        .over(Window().partitionBy('user_id').orderBy(F.col('date').desc())))\
+        .filter(F.col('city') != F.col('city_name_lag_1_desc')))
+
+    home_city_df = (temp_df.withColumn('date_lag',F.coalesce(F.lag('date')\
+        .over(Window().partitionBy('user_id').orderBy(F.col('date').desc())),F.col('max_date')))\
+        .withColumn('date_diff',F.datediff(F.col('date_lag'),F.col('date')))\
+        .filter(F.col('date_diff') > 27)\
+        .withColumn('row',F.row_number()\
+        .over(Window.partitionBy("user_id").orderBy(F.col("date").desc())))\
+        .filter(F.col('row') == 1)\
+        .drop('date','city_name_lag_1_desc','date_lag','row','date_diff','max_date'))
 
     users_dm = true_city_df.join(home_city_df, "user_id", "left")
 
